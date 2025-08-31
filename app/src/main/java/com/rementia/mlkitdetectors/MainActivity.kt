@@ -6,6 +6,7 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
@@ -13,10 +14,9 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
+import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -27,11 +27,14 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetectorOptions
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.Executors
+ 
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -51,51 +54,61 @@ fun DetectorScreen() {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
 
-    var hasPermission by remember {
-        mutableStateOf(
-            ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
-        )
+    var hasPermission by remember { mutableStateOf(
+        ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED)
     }
-
-    val requestPermission = remember {
-        (context as ComponentActivity).registerForActivityResult(
-            ActivityResultContracts.RequestPermission()
-        ) { granted -> hasPermission = granted }
-    }
-
-    LaunchedEffect(Unit) {
-        if (!hasPermission) requestPermission.launch(Manifest.permission.CAMERA)
-    }
+    val permissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted -> hasPermission = granted }
+    LaunchedEffect(Unit) { if (!hasPermission) permissionLauncher.launch(Manifest.permission.CAMERA) }
 
     if (!hasPermission) {
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Text("Requesting camera permission…")
-        }
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("Requesting camera permission…") }
         return
     }
 
     val previewView = remember { PreviewView(context) }
 
     // UI state for simple accuracy/debug visualization
-    var detected by remember { mutableStateOf(false) }
-    var facesCount by remember { mutableStateOf(0) }
-    var fps by remember { mutableStateOf(0.0) }
-    var lastLatencyMs by remember { mutableStateOf(0L) }
+    var detected by rememberSaveable { mutableStateOf(false) }
+    var facesCount by rememberSaveable { mutableStateOf(0) }
+    var fps by rememberSaveable { mutableStateOf(0.0) }
+    var lastLatencyMs by rememberSaveable { mutableStateOf(0L) }
 
-    LaunchedEffect(hasPermission) {
-        if (!hasPermission) return@LaunchedEffect
+    // Connection gate (demo): run ML only when not connected, like main app
+    var isConnected by rememberSaveable { mutableStateOf(false) }
+
+    // Pose state (shared with overlay)
+    var poseDetected by rememberSaveable { mutableStateOf(false) } // raw (per frame)
+    var poseLandmarks by rememberSaveable { mutableStateOf(0) }
+    var poseStable by rememberSaveable { mutableStateOf(false) }    // debounced/stable
+    var poseValidCount by rememberSaveable { mutableStateOf(0) }
+    var poseInvalidCount by rememberSaveable { mutableStateOf(0) }
+    // Only consecutive-frame debouncing; keep ML Kit defaults
+    val POSE_CONSECUTE_VALID = 3
+    val POSE_CONSECUTE_INVALID = 3
+
+    // Wake removed in demo
+
+    LaunchedEffect(hasPermission, isConnected) {
+        if (!hasPermission || isConnected) return@LaunchedEffect
         val cameraProvider = ProcessCameraProvider.getInstance(context).get()
 
         val preview = androidx.camera.core.Preview.Builder().build().also {
             it.setSurfaceProvider(previewView.surfaceProvider)
         }
 
-        // ML Kit Face detector (fast mode, tracking on)
+        // ML Kit Face detector (fast mode, tracking on) + Pose detector
         val options = FaceDetectorOptions.Builder()
             .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
             .enableTracking()
             .build()
         val detector = FaceDetection.getClient(options)
+        val poseDetector = com.google.mlkit.vision.pose.PoseDetection.getClient(
+            com.google.mlkit.vision.pose.defaults.PoseDetectorOptions.Builder()
+                .setDetectorMode(com.google.mlkit.vision.pose.defaults.PoseDetectorOptions.STREAM_MODE)
+                .build()
+        )
 
         val executor = Executors.newSingleThreadExecutor()
 
@@ -112,19 +125,45 @@ fun DetectorScreen() {
                         val media = image.image
                         if (media != null) {
                             val input = InputImage.fromMediaImage(media, image.imageInfo.rotationDegrees)
-                            detector.process(input)
+                            val faceTask = detector.process(input)
                                 .addOnSuccessListener { faces ->
-                                    facesCount = faces.size
-                                    detected = faces.isNotEmpty()
+                                    val cnt = faces.size
+                                    facesCount = cnt
+                                    detected = cnt > 0
+                                }
+                                .addOnFailureListener { detected = false }
+
+                            val poseTask = poseDetector.process(input)
+                                .addOnSuccessListener { pose ->
+                                    val all = pose.allPoseLandmarks
+                                    poseLandmarks = all.size
+                                    val isValid = all.isNotEmpty()
+                                    poseDetected = isValid
+
+                                    // Debounce/hysteresis to achieve stability
+                                    if (isValid) {
+                                        poseValidCount += 1
+                                        poseInvalidCount = 0
+                                        if (poseValidCount >= POSE_CONSECUTE_VALID) poseStable = true
+                                    } else {
+                                        poseInvalidCount += 1
+                                        poseValidCount = 0
+                                        if (poseInvalidCount >= POSE_CONSECUTE_INVALID) poseStable = false
+                                    }
+                                }
+                                .addOnFailureListener {
+                                    poseDetected = false
+                                    poseInvalidCount += 1
+                                    poseValidCount = 0
+                                    if (poseInvalidCount >= POSE_CONSECUTE_INVALID) poseStable = false
+                                }
+
+                            com.google.android.gms.tasks.Tasks.whenAllComplete(faceTask, poseTask)
+                                .addOnCompleteListener {
                                     lastLatencyMs = (System.nanoTime() - began) / 1_000_000
                                     val count = frameCounter.incrementAndGet()
                                     val elapsedSec = (System.nanoTime() - startNs) / 1_000_000_000.0
                                     if (elapsedSec > 0) fps = count / elapsedSec
-                                }
-                                .addOnFailureListener {
-                                    detected = false
-                                }
-                                .addOnCompleteListener {
                                     image.close()
                                 }
                         } else {
@@ -148,47 +187,65 @@ fun DetectorScreen() {
     }
 
     val statusColor = when {
-        detected && facesCount > 0 -> Color(0xFF22C55E) // green
-        !detected && facesCount == 0 -> Color(0xFFEF4444) // red
-        else -> Color(0xFFF59E0B) // amber
+        isConnected -> Color(0xFF22C55E)
+        detected && facesCount > 0 -> Color(0xFF22C55E)
+        !detected && facesCount == 0 -> Color(0xFFEF4444)
+        else -> Color(0xFFF59E0B)
     }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color.Black)
-            .padding(16.dp)
-    ) {
-        // Top bar with metrics
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-            Text("Faces: $facesCount", color = Color.White, fontWeight = FontWeight.Bold)
-            Text(String.format("FPS: %.1f", fps), color = Color.White, fontWeight = FontWeight.Medium)
-            Text("Latency: ${lastLatencyMs}ms", color = Color.White)
-        }
+    // Minimal overlay UI over full-screen camera preview
+    Box(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+        // Camera preview occupies the whole screen
+        AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
 
-        Spacer(Modifier.height(12.dp))
-
-        // Camera preview
-        AndroidView(factory = { previewView }, modifier = Modifier
-            .fillMaxWidth()
-            .weight(1f))
-
-        Spacer(Modifier.height(12.dp))
-
-        // Status pill
+        // Top-left: ML Kit tiny chips (Face & Pose)
+        val faceLabel by remember { derivedStateOf { if (detected) "Face ✓ ($facesCount)" else "No face" } }
         Box(
             modifier = Modifier
-                .fillMaxWidth()
-                .height(48.dp)
-                .background(statusColor),
-            contentAlignment = Alignment.Center
+                .align(Alignment.TopStart)
+                .padding(12.dp)
+                .background(Color.Black.copy(alpha = 0.5f), RoundedCornerShape(16.dp))
+                .padding(horizontal = 12.dp, vertical = 8.dp)
         ) {
-            Text(
-                text = if (detected) "DETECTED" else "NO DETECTION",
-                color = Color.Black,
-                fontSize = 18.sp,
-                fontWeight = FontWeight.Bold
-            )
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Box(modifier = Modifier.size(8.dp).background(if (detected) Color(0xFF22C55E) else Color(0xFFEF4444), CircleShape))
+                    Text(faceLabel, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+                }
+                // Pose line
+                val poseText = if (poseStable) "Pose ✓ ($poseLandmarks)" else "Pose – none"
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Box(modifier = Modifier.size(8.dp).background(Color(0xFF06B6D4), CircleShape))
+                    Text(
+                        text = poseText,
+                        color = Color.White,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
+        }
+
+        // Wake overlay removed
+
+        // Bottom-center: Connect floating button（Disconnectは非表示）
+        Row(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 20.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            if (!isConnected) {
+                Button(
+                    onClick = { isConnected = true },
+                    enabled = hasPermission && (detected || poseStable),
+                    shape = RoundedCornerShape(24.dp)
+                ) {
+                    Text("Connect", fontSize = 16.sp, modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp))
+                }
+            }
         }
     }
+
+    // Wake removed
 }

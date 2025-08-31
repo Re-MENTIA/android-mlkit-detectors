@@ -72,6 +72,10 @@ dependencies {
 
     // ML Kit: Face Detection (play-services)
     implementation("com.google.android.gms:play-services-mlkit-face-detection:17.1.0")
+    // ML Kit: Pose Detection (both base & accurate for compatibility with defaults API)
+    implementation("com.google.mlkit:pose-detection:17.0.0")
+    implementation("com.google.mlkit:pose-detection-accurate:17.0.0")
+
 
     // Kotlin/AndroidX
     implementation("androidx.core:core-ktx:1.12.0")
