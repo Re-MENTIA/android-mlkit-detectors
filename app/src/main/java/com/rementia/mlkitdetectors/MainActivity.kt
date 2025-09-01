@@ -86,7 +86,7 @@ fun DetectorScreen() {
     var isConnected by rememberSaveable { mutableStateOf(false) }
     val frameGate = remember { FrameSimilarityGate(context) }
     val lastAcceptedFrameRef = remember { AtomicReference<Bitmap?>(null) }
-    val yuvConverter = remember { YuvToRgbConverter(context) }
+    val yuvConverter = remember { YuvToRgbConverter() }
 
     // Pose state (shared with overlay)
     var poseDetected by rememberSaveable { mutableStateOf(false) } // raw (per frame)
