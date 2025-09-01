@@ -42,6 +42,10 @@ android {
         resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
     }
 
+    androidResources {
+        noCompress += listOf("tflite")
+    }
+
     kotlinOptions {
         jvmTarget = "1.8"
         freeCompilerArgs = freeCompilerArgs + listOf("-Xjvm-default=all")
@@ -75,6 +79,9 @@ dependencies {
     // ML Kit: Pose Detection (both base & accurate for compatibility with defaults API)
     implementation("com.google.mlkit:pose-detection:17.0.0")
     implementation("com.google.mlkit:pose-detection-accurate:17.0.0")
+
+    // MediaPipe Tasks: Image Embedder (MobileNetV3)
+    implementation("com.google.mediapipe:tasks-vision:0.10.14")
 
 
     // Kotlin/AndroidX

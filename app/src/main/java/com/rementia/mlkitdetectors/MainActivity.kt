@@ -34,6 +34,11 @@ import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetectorOptions
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicReference
+import android.graphics.Bitmap
+import android.widget.Toast
+import com.rementia.mlkitdetectors.ml.FrameSimilarityGate
+import com.rementia.mlkitdetectors.ml.YuvToRgbConverter
  
 
 class MainActivity : ComponentActivity() {
@@ -77,6 +82,10 @@ fun DetectorScreen() {
 
     // Connection gate (demo): run ML only when not connected, like main app
     var isConnected by rememberSaveable { mutableStateOf(false) }
+    // 類似度ゲート（通話直前の差分チェック）
+    val frameGate = remember { FrameSimilarityGate(context) }
+    val lastAcceptedFrameRef = remember { AtomicReference<Bitmap?>(null) }
+    val yuvConverter = remember { YuvToRgbConverter(context) }
 
     // Pose state (shared with overlay)
     var poseDetected by rememberSaveable { mutableStateOf(false) } // raw (per frame)
@@ -160,11 +169,24 @@ fun DetectorScreen() {
 
                             com.google.android.gms.tasks.Tasks.whenAllComplete(faceTask, poseTask)
                                 .addOnCompleteListener {
-                                    lastLatencyMs = (System.nanoTime() - began) / 1_000_000
-                                    val count = frameCounter.incrementAndGet()
-                                    val elapsedSec = (System.nanoTime() - startNs) / 1_000_000_000.0
-                                    if (elapsedSec > 0) fps = count / elapsedSec
-                                    image.close()
+                                    try {
+                                        // 認識パス時に最後のフレームをBitmap化して保持（通話直前に判定に使用）
+                                        if ((detected || poseStable) && image.image != null) {
+                                            val bmp = Bitmap.createBitmap(image.width, image.height, Bitmap.Config.ARGB_8888)
+                                            try {
+                                                yuvConverter.convert(image.image!!, bmp)
+                                                lastAcceptedFrameRef.set(bmp)
+                                            } catch (_: Throwable) {
+                                                // 失敗時はスキップ
+                                            }
+                                        }
+                                    } finally {
+                                        lastLatencyMs = (System.nanoTime() - began) / 1_000_000
+                                        val count = frameCounter.incrementAndGet()
+                                        val elapsedSec = (System.nanoTime() - startNs) / 1_000_000_000.0
+                                        if (elapsedSec > 0) fps = count / elapsedSec
+                                        image.close()
+                                    }
                                 }
                         } else {
                             image.close()
@@ -237,7 +259,15 @@ fun DetectorScreen() {
         ) {
             if (!isConnected) {
                 Button(
-                    onClick = { isConnected = true },
+                    onClick = {
+                        val bmp = lastAcceptedFrameRef.get()
+                        val ok = bmp?.let { frameGate.shouldAccept(it) } ?: true
+                        if (ok) {
+                            isConnected = true
+                        } else {
+                            Toast.makeText(context, "同じシーンと判断したため、通話をスキップしました", Toast.LENGTH_SHORT).show()
+                        }
+                    },
                     enabled = hasPermission && (detected || poseStable),
                     shape = RoundedCornerShape(24.dp)
                 ) {
